@@ -1,0 +1,14 @@
+pandas
+numpy
+requests
+SPARQLWrapper
+rapidfuzz
+geopy
+sqlalchemy
+psycopg2-binary
+python-dotenv
+beautifulsoup4
+lxml
+geopandas
+shapely
+pyarrow
