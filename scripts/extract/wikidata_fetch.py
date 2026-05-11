@@ -8,7 +8,7 @@ from collections import defaultdict
 SPARQL_URL = "https://query.wikidata.org/sparql"
 
 QUERY_TEMPLATE = """
-SELECT ?place ?placeLabel ?coord ?image ?countryLabel ?article WHERE {
+SELECT ?place ?placeLabel ?coord ?image ?countryLabel ?article (COUNT(?sitelink) AS ?sitelinks) WHERE {
   ?place wdt:P31/wdt:P279* wd:%s.
   ?place wdt:P625 ?coord.
   ?place wdt:P18 ?image.
@@ -19,10 +19,15 @@ SELECT ?place ?placeLabel ?coord ?image ?countryLabel ?article WHERE {
              schema:isPartOf <https://en.wikipedia.org/>.
   }
 
+  # Count sitelinks as popularity proxy — Taj Mahal ~100, obscure place ~3
+  OPTIONAL { ?sitelink schema:about ?place. }
+
   SERVICE wikibase:label {
     bd:serviceParam wikibase:language "en".
   }
 }
+GROUP BY ?place ?placeLabel ?coord ?image ?countryLabel ?article
+ORDER BY DESC(?sitelinks)
 LIMIT %s
 OFFSET %s
 """
@@ -33,36 +38,52 @@ HEADERS = {
 
 # ── Balance config ────────────────────────────────────────────────────────────
 
-# No country can contribute more than this fraction of a category's global target.
-# e.g. if target=800 for history_and_mysteries, no country gets more than 800*0.15=120
-MAX_COUNTRY_SHARE = 0.15
+# Hard cap: no country can have more than this many POIs in TOTAL across all categories
+MAX_POIS_PER_COUNTRY = 100
 
-# Hard cap: even for very large targets, no single country exceeds this per category.
-MAX_PER_COUNTRY_PER_CATEGORY = 80
-
-# Countries with a huge amount of well-documented Wikidata entries.
-# They get a slightly higher share since they genuinely have more places.
-HIGH_POI_COUNTRIES = {
-    "United States", "United Kingdom", "Germany", "France", "Italy",
-    "India", "China", "Japan", "Spain", "Russia", "Australia", "Brazil",
-    "Canada", "Mexico", "Turkey", "Greece", "Egypt", "Iran", "Indonesia",
-    "Poland", "Netherlands", "Sweden", "Norway", "Switzerland", "Austria",
+# Per-category per-country caps.
+# Concentrated categories (landmarks, castles) need a higher allowance because
+# a handful of countries genuinely have many more of them.
+# Spread categories (volcanoes, rivers) stay low.
+# Rule of thumb: target / 25 categories = ~4 baseline; adjust up for concentrated ones.
+CATEGORY_COUNTRY_CAPS = {
+    "airports":             4,
+    "peaks":                4,
+    "volcanoes":            3,
+    "deserts":              5,
+    "oceans":               2,
+    "seas":                 3,
+    "rivers":               4,
+    "lakes":                4,
+    "waterfalls":           4,
+    "islands":              6,
+    "glaciers":             6,
+    "natural":              4,
+    "national_parks":       8,
+    "cities":              10,
+    "landmarks":           15,
+    "skyscrapers":         15,
+    "bridges":              8,
+    "castles":             12,
+    "stadiums":             8,
+    "universities":        10,
+    "museums":             12,
+    "infrastructure":       5,
+    "space":               10,
+    "markets":              5,
+    "history_and_mysteries": 15,
 }
-HIGH_POI_SHARE_BONUS = 0.05   # +5% share for high-POI countries
+
+DEFAULT_CATEGORY_COUNTRY_CAP = 4   # fallback for any category not listed above
+
+# SPARQL page size
+FETCH_LIMIT = 200
+
+# Polite delay between SPARQL requests (seconds)
+REQUEST_DELAY = 4
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
-
-def country_cap(country: str, target: int) -> int:
-    """
-    Calculate the max POIs allowed for a single country within a category.
-    """
-    share = MAX_COUNTRY_SHARE
-    if country in HIGH_POI_COUNTRIES:
-        share += HIGH_POI_SHARE_BONUS
-    cap = int(target * share)
-    return min(cap, MAX_PER_COUNTRY_PER_CATEGORY)
-
 
 def run_query(query: str, retries: int = 6):
     for attempt in range(retries):
@@ -74,16 +95,16 @@ def run_query(query: str, retries: int = 6):
                 timeout=180
             )
             if response.status_code in [429, 500, 502, 503, 504]:
-                wait_time = 5 * (attempt + 1)
-                print(f"  Server error {response.status_code}. Retrying in {wait_time}s...")
-                sleep(wait_time)
+                wait = 5 * (attempt + 1)
+                print(f"    Server error {response.status_code}. Retrying in {wait}s...")
+                sleep(wait)
                 continue
             response.raise_for_status()
             return response.json()
         except requests.exceptions.RequestException as e:
-            wait_time = 5 * (attempt + 1)
-            print(f"  Request failed: {e}. Retrying in {wait_time}s...")
-            sleep(wait_time)
+            wait = 5 * (attempt + 1)
+            print(f"    Request failed: {e}. Retrying in {wait}s...")
+            sleep(wait)
     raise Exception("Failed after retries")
 
 
@@ -93,14 +114,19 @@ def parse_results(data, category):
         image_url = item.get("image", {}).get("value")
         if not image_url:
             continue
+        country = item.get("countryLabel", {}).get("value") or "Unknown"
+        # Skip Wikidata internal IDs surfacing as country names (e.g. "Q12345")
+        if country.startswith("Q") and country[1:].isdigit():
+            country = "Unknown"
         rows.append({
-            "wikidata_id": item.get("place", {}).get("value", "").split("/")[-1],
-            "name": item.get("placeLabel", {}).get("value"),
-            "category": category,
-            "coordinates": item.get("coord", {}).get("value"),
-            "image_url": image_url,
-            "country": item.get("countryLabel", {}).get("value"),
-            "wikipedia_url": item.get("article", {}).get("value")
+            "wikidata_id":   item.get("place", {}).get("value", "").split("/")[-1],
+            "name":          item.get("placeLabel", {}).get("value"),
+            "category":      category,
+            "coordinates":   item.get("coord", {}).get("value"),
+            "image_url":     image_url,
+            "country":       country,
+            "wikipedia_url": item.get("article", {}).get("value"),
+            "sitelinks":     int(item.get("sitelinks", {}).get("value", 0)),
         })
     return rows
 
@@ -114,29 +140,38 @@ def main():
     with open("config/targets.json", "r", encoding="utf-8") as f:
         targets = json.load(f)
 
+    # Only consider categories with a non-zero target
+    active_categories = [c for c in categories if targets.get(c, 0) > 0]
+
+    print(f"Active categories    : {len(active_categories)}")
+    print(f"Max POIs per country : {MAX_POIS_PER_COUNTRY}  (total across all categories)")
+    print(f"\n  Per-category/country caps:")
+    for cat in active_categories:
+        cap = CATEGORY_COUNTRY_CAPS.get(cat, DEFAULT_CATEGORY_COUNTRY_CAP)
+        print(f"    {cat:<30} {cap}")
+    print()
+
     all_rows = []
-    limit = 200  # results per SPARQL page
 
-    for category, qid in categories.items():
-        target_count = targets.get(category, 0)
+    # Shared counters across all categories
+    country_total    = defaultdict(int)                        # total per country
+    country_category = defaultdict(lambda: defaultdict(int))   # per country per category
+    seen_ids         = set()                                   # global wikidata_id dedup
 
-        if target_count == 0:
-            print(f"Skipping {category} (no target count set)")
-            continue
+    for category in active_categories:
+        qid          = categories[category]
+        target_count = targets[category]
 
         print(f"\n{'='*60}")
-        print(f"  Category : {category}  |  Target: {target_count}")
+        print(f"  {category.upper()}  |  global target: {target_count}")
         print(f"{'='*60}")
 
-        offset = 0
-        collected = 0                          # total accepted for this category
-        country_counts = defaultdict(int)      # per-country accepted counts
-        seen_ids = set()                       # deduplicate within category
-
-        consecutive_empty_pages = 0
+        offset            = 0
+        collected         = 0
+        empty_page_streak = 0
 
         while collected < target_count:
-            query = QUERY_TEMPLATE % (qid, limit, offset)
+            query = QUERY_TEMPLATE % (qid, FETCH_LIMIT, offset)
 
             try:
                 data = run_query(query)
@@ -146,53 +181,64 @@ def main():
                 break
 
             if not rows:
-                consecutive_empty_pages += 1
-                if consecutive_empty_pages >= 2:
-                    print(f"  No more results. Stopping early at {collected}/{target_count}.")
+                empty_page_streak += 1
+                if empty_page_streak >= 2:
+                    print(f"  No more results. Stopping at {collected}/{target_count}.")
                     break
-                offset += limit
-                sleep(4)
+                offset += FETCH_LIMIT
+                sleep(REQUEST_DELAY)
                 continue
 
-            consecutive_empty_pages = 0
+            empty_page_streak  = 0
             accepted_this_page = 0
 
             for row in rows:
-                wid = row["wikidata_id"]
-                country = row.get("country") or "Unknown"
+                wid     = row["wikidata_id"]
+                country = row["country"]
 
-                # Skip already-seen wikidata IDs (handles multi-country rows)
+                # Gate 1: skip globally seen wikidata IDs
+                # (same place returned for multiple historical countries)
                 if wid in seen_ids:
                     continue
 
-                # Skip if this country has hit its per-category cap
-                cap = country_cap(country, target_count)
-                if country_counts[country] >= cap:
+                # Gate 2: skip if country has hit its TOTAL 100-POI cap
+                if country_total[country] >= MAX_POIS_PER_COUNTRY:
                     continue
 
-                # Accept this row
+                # Gate 3: skip if country has hit its per-category cap
+                cat_cap = CATEGORY_COUNTRY_CAPS.get(category, DEFAULT_CATEGORY_COUNTRY_CAP)
+                if country_category[country][category] >= cat_cap:
+                    continue
+
+                # ✓ Accept
                 seen_ids.add(wid)
-                country_counts[country] += 1
+                country_total[country]             += 1
+                country_category[country][category] += 1
                 all_rows.append(row)
-                collected += 1
+                collected          += 1
                 accepted_this_page += 1
 
                 if collected >= target_count:
                     break
 
-            print(f"  Offset {offset:>6} | Page results: {len(rows):>3} | "
-                  f"Accepted: {accepted_this_page:>3} | Total: {collected}/{target_count}")
+            print(f"  offset {offset:>6} | page: {len(rows):>3} | "
+                  f"accepted: {accepted_this_page:>3} | "
+                  f"category total: {collected}/{target_count}")
 
-            offset += limit
-            sleep(4)
+            offset += FETCH_LIMIT
+            sleep(REQUEST_DELAY)
 
-        # Per-category country breakdown
-        top_countries = sorted(country_counts.items(), key=lambda x: -x[1])[:8]
-        print(f"\n  Country distribution (top 8):")
-        for c, n in top_countries:
-            bar = "█" * n
-            print(f"    {c:<30} {n:>4}  {bar}")
+        # Country breakdown for this category
+        cat_rows   = [r for r in all_rows if r["category"] == category]
+        by_country = defaultdict(int)
+        for r in cat_rows:
+            by_country[r["country"]] += 1
+        top = sorted(by_country.items(), key=lambda x: -x[1])[:10]
+        print(f"\n  Top countries for {category}:")
+        for c, n in top:
+            print(f"    {c:<35} {n:>3}")
 
+    # ── Save ──────────────────────────────────────────────────────────────────
     df = pd.DataFrame(all_rows)
     df = df[df["image_url"].notna()]
 
@@ -200,16 +246,23 @@ def main():
     output = "data/raw/wikidata_pois_images_only.csv"
     df.to_csv(output, index=False)
 
+    # ── Final report ──────────────────────────────────────────────────────────
     print(f"\n{'='*60}")
-    print(f"  DONE")
-    print(f"  Saved  : {output}")
-    print(f"  Total  : {len(df)} rows")
+    print(f"  DONE  |  {len(df):,} total POIs  |  "
+          f"{df['country'].nunique()} countries")
+    print(f"{'='*60}")
 
-    # Global category summary
-    print(f"\n  Category summary:")
+    print(f"\n  Per-category totals:")
     for cat, grp in df.groupby("category"):
-        print(f"    {cat:<30} {len(grp):>5} POIs  |  "
-              f"{grp['country'].nunique()} countries")
+        print(f"    {cat:<30} {len(grp):>5}  ({grp['country'].nunique()} countries)")
+
+    print(f"\n  Countries with most POIs (top 20):")
+    top_countries = df["country"].value_counts().head(20)
+    for country, n in top_countries.items():
+        bar = "█" * (n // 2)
+        print(f"    {country:<35} {n:>4}  {bar}")
+
+    print(f"\n  Saved: {output}")
 
 
 if __name__ == "__main__":
