@@ -41,43 +41,44 @@ HEADERS = {
 MAX_POIS_PER_COUNTRY = 100
 
 CATEGORY_COUNTRY_CAPS = {
-    "airports":              4,
-    "peaks":                 4,
-    "volcanoes":             3,
-    "deserts":               5,
+    "airports":              3,
+    "peaks":                 3,
+    "volcanoes":             2,
+    "deserts":               4,
     "oceans":                2,
-    "seas":                  3,
-    "rivers":                4,
-    "lakes":                 4,
-    "waterfalls":            4,
-    "islands":               6,
-    "glaciers":              6,
-    "natural":               4,
-    "national_parks":        8,
-    "cities":               10,
-    "landmarks":            15,
-    "skyscrapers":          15,
-    "bridges":               8,
-    "castles":              12,
-    "stadiums":              8,
-    "universities":         10,
-    "museums":              12,
-    "infrastructure":        5,
-    "space":                10,
-    "markets":               5,
-    "history_and_mysteries": 15,
+    "seas":                  2,
+    "rivers":                3,
+    "lakes":                 3,
+    "waterfalls":            3,
+    "islands":               5,
+    "glaciers":              4,
+    "natural":               3,
+    "national_parks":        6,
+    "cities":                8,
+    "landmarks":            20,
+    "skyscrapers":          10,
+    "bridges":               6,
+    "castles":              15,
+    "stadiums":              4,
+    "universities":          5,
+    "museums":               5,
+    "infrastructure":        0,
+    "space":                 5,
+    "markets":               3,
+    "history_and_mysteries": 18,
 }
 
 DEFAULT_CATEGORY_COUNTRY_CAP = 4
 
-FETCH_LIMIT    = 200
-REQUEST_DELAY  = 4
+FETCH_LIMIT = 200
+REQUEST_DELAY = 4
 
 # ── Checkpoint config ─────────────────────────────────────────────────────────
 
-CHECKPOINT_DIR  = Path("data/checkpoint")
+CHECKPOINT_DIR = Path("data/checkpoint")
 CHECKPOINT_ROWS = CHECKPOINT_DIR / "rows.csv"        # all accepted rows so far
-CHECKPOINT_META = CHECKPOINT_DIR / "meta.json"       # counters + completed categories
+# counters + completed categories
+CHECKPOINT_META = CHECKPOINT_DIR / "meta.json"
 
 
 # ── Checkpoint helpers ────────────────────────────────────────────────────────
@@ -125,7 +126,7 @@ def load_checkpoint():
         for cat, n in cats.items():
             country_category[country][cat] = n
 
-    seen_ids             = set(meta["seen_ids"])
+    seen_ids = set(meta["seen_ids"])
     completed_categories = set(meta["completed_categories"])
 
     print(f"  Rows loaded       : {len(all_rows)}")
@@ -156,7 +157,8 @@ def run_query(query: str, retries: int = 6):
             )
             if response.status_code in [429, 500, 502, 503, 504]:
                 wait = 5 * (attempt + 1)
-                print(f"    Server error {response.status_code}. Retrying in {wait}s...")
+                print(
+                    f"    Server error {response.status_code}. Retrying in {wait}s...")
                 sleep(wait)
                 continue
             response.raise_for_status()
@@ -206,10 +208,10 @@ def main():
     if checkpoint:
         all_rows, country_total, country_category, seen_ids, completed_categories = checkpoint
     else:
-        all_rows             = []
-        country_total        = defaultdict(int)
-        country_category     = defaultdict(lambda: defaultdict(int))
-        seen_ids             = set()
+        all_rows = []
+        country_total = defaultdict(int)
+        country_category = defaultdict(lambda: defaultdict(int))
+        seen_ids = set()
         completed_categories = set()
 
     print(f"Active categories    : {len(active_categories)}")
@@ -224,15 +226,15 @@ def main():
             print(f"  Skipping {category} (already completed in checkpoint)")
             continue
 
-        qid          = categories[category]
+        qid = categories[category]
         target_count = targets[category]
 
         print(f"\n{'='*60}")
         print(f"  {category.upper()}  |  global target: {target_count}")
         print(f"{'='*60}")
 
-        offset            = 0
-        collected         = 0
+        offset = 0
+        collected = 0
         empty_page_streak = 0
 
         try:
@@ -243,23 +245,25 @@ def main():
                     data = run_query(query)
                     rows = parse_results(data, category)
                 except Exception as e:
-                    print(f"  ERROR at offset {offset}: {e}. Skipping category.")
+                    print(
+                        f"  ERROR at offset {offset}: {e}. Skipping category.")
                     break
 
                 if not rows:
                     empty_page_streak += 1
                     if empty_page_streak >= 2:
-                        print(f"  No more results. Stopping at {collected}/{target_count}.")
+                        print(
+                            f"  No more results. Stopping at {collected}/{target_count}.")
                         break
                     offset += FETCH_LIMIT
                     sleep(REQUEST_DELAY)
                     continue
 
-                empty_page_streak  = 0
+                empty_page_streak = 0
                 accepted_this_page = 0
 
                 for row in rows:
-                    wid     = row["wikidata_id"]
+                    wid = row["wikidata_id"]
                     country = row["country"]
 
                     if wid in seen_ids:
@@ -268,16 +272,17 @@ def main():
                     if country_total[country] >= MAX_POIS_PER_COUNTRY:
                         continue
 
-                    cat_cap = CATEGORY_COUNTRY_CAPS.get(category, DEFAULT_CATEGORY_COUNTRY_CAP)
+                    cat_cap = CATEGORY_COUNTRY_CAPS.get(
+                        category, DEFAULT_CATEGORY_COUNTRY_CAP)
                     if country_category[country][category] >= cat_cap:
                         continue
 
                     # ✓ Accept
                     seen_ids.add(wid)
-                    country_total[country]             += 1
+                    country_total[country] += 1
                     country_category[country][category] += 1
                     all_rows.append(row)
-                    collected          += 1
+                    collected += 1
                     accepted_this_page += 1
 
                     if collected >= target_count:
@@ -293,7 +298,8 @@ def main():
         except KeyboardInterrupt:
             # Ctrl+C pressed mid-category — save what we have and exit cleanly
             print(f"\n\nInterrupted during '{category}' at offset {offset}.")
-            print(f"Saving checkpoint with {len(all_rows)} rows collected so far...")
+            print(
+                f"Saving checkpoint with {len(all_rows)} rows collected so far...")
             save_checkpoint(all_rows, country_total, country_category,
                             seen_ids, completed_categories)
             print("Run the script again to resume from this point.")
@@ -305,7 +311,7 @@ def main():
                         seen_ids, completed_categories)
 
         # Country breakdown for this category
-        cat_rows   = [r for r in all_rows if r["category"] == category]
+        cat_rows = [r for r in all_rows if r["category"] == category]
         by_country = defaultdict(int)
         for r in cat_rows:
             by_country[r["country"]] += 1
@@ -333,7 +339,8 @@ def main():
 
     print(f"\n  Per-category totals:")
     for cat, grp in df.groupby("category"):
-        print(f"    {cat:<30} {len(grp):>5}  ({grp['country'].nunique()} countries)")
+        print(
+            f"    {cat:<30} {len(grp):>5}  ({grp['country'].nunique()} countries)")
 
     print(f"\n  Countries with most POIs (top 20):")
     top_countries = df["country"].value_counts().head(20)
